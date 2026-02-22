@@ -6,7 +6,7 @@ import time
 # Ayarlar
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-BYBIT_BASE = "https://api.bybit.com"
+OKX_BASE = "https://www.okx.com"
 
 def send_telegram(msg):
     if TOKEN and CHAT_ID:
@@ -15,69 +15,77 @@ def send_telegram(msg):
             requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
         except: pass
 
-def get_data(endpoint, params={}):
+def get_okx_data(endpoint, params={}):
     try:
-        res = requests.get(BYBIT_BASE + endpoint, params=params, timeout=10).json()
-        return res['result'].get('list', []) if res['retCode'] == 0 else []
+        res = requests.get(OKX_BASE + endpoint, params=params, timeout=10).json()
+        return res.get('data', [])
     except: return []
 
-def get_orderbook_liquidity(symbol, current_price):
+def get_orderbook_analysis(symbol, current_price):
     """
-    Emir defterindeki (Asks) yığılmayı kaldıraç patlama noktalarına göre ölçer.
+    OKX Orderbook üzerinden likidasyon seviyelerindeki hacmi hesaplar.
     """
-    depth = get_data("/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": "200"})
-    if not depth or 'a' not in depth[0]: return None
+    # sz: 100 ile derin bir tahta okuyoruz
+    depth = get_okx_data("/api/v5/market/books", {"instId": symbol, "sz": "100"})
+    if not depth: return None
     
-    asks = depth[0]['a'] # [Fiyat, Miktar]
+    asks = depth[0]['asks'] # [Fiyat, Miktar, ...]
     
     # Kaldıraç Patlama Hesapları (Shortlar için yukarı yönlü)
-    # 50x likidasyon genelde %1.8 - %2.0 yukarıdadır
-    # 25x likidasyon genelde %3.8 - %4.0 yukarıdadır
+    # 50x likidasyon: %2 yukarıda | 25x likidasyon: %4 yukarıda
     levels = {
         "50x": current_price * 1.02,
         "25x": current_price * 1.04
     }
     
     analysis = {}
-    for label, price in levels.items():
-        # Belirlenen fiyat seviyesine kadar olan toplam satış emri (stop-loss) hacmi
-        total_vol = sum([float(a[1]) for a in asks if float(a[0]) <= price])
-        analysis[label] = {"price": round(price, 4), "vol": round(total_vol, 2)}
+    for label, target_price in levels.items():
+        # Belirlenen fiyata kadar olan toplam kontrat miktarı
+        total_vol = sum([float(a[1]) for a in asks if float(a[0]) <= target_price])
+        analysis[label] = {"price": round(target_price, 4), "vol": round(total_vol, 2)}
         
     return analysis
 
 def scan():
-    print("Likidasyon taraması başladı...")
-    tickers = get_data("/v5/market/tickers", {"category": "linear"})
+    print("OKX Tarama Başlatıldı (Likidasyon Analizi)...")
+    # Tüm SWAP (Vadeli) pariteleri çek
+    tickers = get_okx_data("/api/v5/market/tickers", {"instType": "SWAP"})
     
     for t in tickers:
-        symbol = t['symbol']
-        if not symbol.endswith("USDT"): continue
+        symbol = t['instId']
+        if "-USDT-SWAP" not in symbol: continue
         
-        last_price = float(t['lastPrice'])
-        funding = float(t['fundingRate']) * 100
-        change = float(t['price24hPcnt']) * 100
+        last_price = float(t['last'])
+        open_24h = float(t['open24h'])
+        change = ((last_price / open_24h) - 1) * 100
         
-        # KRİTER: Fonlama negatifse ve fiyat hareketliyse mercek altına al
-        if funding < -0.04:
-            liq = get_orderbook_liquidity(symbol, last_price)
+        # 1. Aşama: Funding Oranını Çek
+        funding_data = get_okx_data("/api/v5/public/funding-rate", {"instId": symbol})
+        if not funding_data: continue
+        funding = float(funding_data[0]['fundingRate']) * 100
+        
+        # STRATEJİ: Sert yükselen VE fonlaması negatif koinlere bak
+        # (Shortçuların kapana kısıldığı yerler)
+        if change > 5 and funding < -0.03:
+            
+            # 2. Aşama: Matematiksel Likidite Analizi
+            liq = get_orderbook_analysis(symbol, last_price)
             if not liq: continue
             
-            # Eğer 50x patlama noktasında ciddi birikmiş hacim varsa bildir
             msg = (
-                f"🚨 *LİKİDASYON ANALİZİ: {symbol}*\n"
+                f"🚨 *OKX LİKİDASYON ANALİZİ: {symbol}*\n"
                 f"💰 Fiyat: `{last_price}`\n"
-                f"💸 Funding: `% {round(funding, 4)}`\n"
-                f"📈 24s Değişim: `% {round(change, 2)}`\n\n"
+                f"📈 24s Değişim: `% {round(change, 2)}`\n"
+                f"💸 Funding: `% {round(funding, 4)}` (Negatif!)\n\n"
                 f"🔥 *SHORT PATLATMA NOKTALARI (Liq):*\n"
-                f"• *50x:* `{liq['50x']['price']}` seviyesine kadar `{liq['50x']['vol']}` adet birikme var.\n"
-                f"• *25x:* `{liq['25x']['price']}` seviyesine kadar `{liq['25x']['vol']}` adet birikme var.\n\n"
-                f"⚠️ *Strateji:* Fiyat `{liq['50x']['price']}` üzerine iğne atıp dönerse, shortçular temizlenmiş olur."
+                f"• *50x:* `{liq['50x']['price']}` seviyesine kadar `{liq['50x']['vol']}` kontrat yığılmış.\n"
+                f"• *25x:* `{liq['25x']['price']}` seviyesine kadar `{liq['25x']['vol']}` kontrat yığılmış.\n\n"
+                f"⚠️ *Strateji:* Fiyat `{liq['50x']['price']}` üzerine iğne atarsa shortçular likit olur. İğne ucu dönüşünü bekle!"
             )
             
             send_telegram(msg)
-            print(f"Sinyal Gönderildi: {symbol}")
-            time.sleep(1) # Telegram limitlerine takılmamak için
+            print(f"Sinyal Bulundu: {symbol}")
+            time.sleep(1) # Telegram limitleri için
 
 if __name__ == "__main__":
     scan()
