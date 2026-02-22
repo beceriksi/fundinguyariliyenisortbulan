@@ -1,0 +1,31 @@
+name: Likidasyon Botu Calistir
+
+on:
+  schedule:
+    # Her 5 dakikada bir otomatik çalıştırır
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # İstediğinde manuel başlatabilmen için
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Depoyu kopyala
+        uses: actions/checkout@v3
+
+      - name: Python Kurulumu
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Kütüphaneleri Yukle
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+
+      - name: Botu Calistir
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py  # Dosya adın farklıysa burayı düzelt
