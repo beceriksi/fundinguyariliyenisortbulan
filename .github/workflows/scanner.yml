@@ -1,17 +1,17 @@
-name: Likidasyon Botu Calistir
+name: OKX Short Scanner Bot
 
 on:
   schedule:
-    # Her 5 dakikada bir otomatik çalıştırır
-    - cron: '*/5 * * * *'
-  workflow_dispatch: # İstediğinde manuel başlatabilmen için
+    # Her 30 dakikada bir otomatik çalışır (UTC saatine göredir)
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Manuel başlatma butonu ekler
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Depoyu kopyala
+      - name: Depoyu Çek (Checkout)
         uses: actions/checkout@v3
 
       - name: Python Kurulumu
@@ -19,13 +19,13 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Kütüphaneleri Yukle
+      - name: Kütüphaneleri Yükle
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas
+          pip install requests pandas numpy
 
-      - name: Botu Calistir
+      - name: Botu Çalıştır
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scanner.py  # Dosya adın farklıysa burayı düzelt
+        run: python scanner.py # Dosya adın farklıysa burayı düzelt
