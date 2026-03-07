@@ -1,91 +1,115 @@
 import requests
 import pandas as pd
+import numpy as np
 import os
-import time
 
-# Ayarlar
+# GitHub Secrets verileri
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-OKX_BASE = "https://www.okx.com"
+
+# STRATEJİ LİMİTLERİN
+RSI_LIMIT = 70
+CHANGE_24H_LIMIT = 8
+WHALE_WALL_RATIO = 2.5
 
 def send_telegram(msg):
     if TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         try:
-            requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-        except: pass
+            res = requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+        except Exception as e:
+            print(f"Bağlantı Hatası: {e}")
 
-def get_okx_data(endpoint, params={}):
+def get_data(endpoint, params={}):
+    base = "https://www.okx.com"
     try:
-        res = requests.get(OKX_BASE + endpoint, params=params, timeout=10).json()
+        res = requests.get(base + endpoint, params=params, timeout=10).json()
         return res.get('data', [])
     except: return []
 
-def get_orderbook_analysis(symbol, current_price):
-    """
-    OKX Orderbook üzerinden likidasyon seviyelerindeki hacmi hesaplar.
-    """
-    # sz: 100 ile derin bir tahta okuyoruz
-    depth = get_okx_data("/api/v5/market/books", {"instId": symbol, "sz": "100"})
-    if not depth: return None
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def get_market_trend():
+    btc = get_data("/api/v5/market/tickers", {"instId": "BTC-USDT-SWAP"})
+    if btc:
+        change = (float(btc[0]['last']) / float(btc[0]['open24h']) - 1) * 100
+        return f"%{round(change, 2)} {'📉' if change < 0 else '📈'}"
+    return "BELİRSİZ"
+
+def check_whale_walls(symbol):
+    depth = get_data("/api/v5/market/books", {"instId": symbol, "sz": "100"}) # Derinlik artırıldı
+    if not depth: return 1, 0
+    asks = sum([float(a[1]) for a in depth[0]['asks']])
+    bids = sum([float(b[1]) for b in depth[0]['bids']])
+    return (asks / bids if bids > 0 else 1), asks
+
+def check_reversal_15m(symbol):
+    """15 dakikalıkta kapanış onayı: Son tepeyi geçememe durumu"""
+    m15 = get_data("/api/v5/market/candles", {"instId": symbol, "bar": "15m", "limit": "5"})
+    if not m15: return False
     
-    asks = depth[0]['asks'] # [Fiyat, Miktar, ...]
+    # 0:güncel, 1:önceki mum | Indexler -> 2:High, 4:Close
+    curr_close = float(m15[0][4])
+    prev_high = float(m15[1][2])
     
-    # Kaldıraç Patlama Hesapları (Shortlar için yukarı yönlü)
-    # 50x likidasyon: %2 yukarıda | 25x likidasyon: %4 yukarıda
-    levels = {
-        "50x": current_price * 1.02,
-        "25x": current_price * 1.04
-    }
-    
-    analysis = {}
-    for label, target_price in levels.items():
-        # Belirlenen fiyata kadar olan toplam kontrat miktarı
-        total_vol = sum([float(a[1]) for a in asks if float(a[0]) <= target_price])
-        analysis[label] = {"price": round(target_price, 4), "vol": round(total_vol, 2)}
-        
-    return analysis
+    # Eğer güncel kapanış önceki tepenin altındaysa 'Güç Kaybı' vardır
+    return curr_close < prev_high
 
 def scan():
-    print("OKX Tarama Başlatıldı (Likidasyon Analizi)...")
-    # Tüm SWAP (Vadeli) pariteleri çek
-    tickers = get_okx_data("/api/v5/market/tickers", {"instType": "SWAP"})
+    print("Tarama başlatıldı (📉 [SHORT BOTU])...")
+    trend = get_market_trend()
+    tickers = get_data("/api/v5/market/tickers", {"instType": "SWAP"})
+    tickers = sorted(tickers, key=lambda x: float(x['vol24h']), reverse=True)
     
+    signals = []
     for t in tickers:
         symbol = t['instId']
-        if "-USDT-SWAP" not in symbol: continue
+        if "-USDT-" not in symbol: continue
         
-        last_price = float(t['last'])
-        open_24h = float(t['open24h'])
-        change = ((last_price / open_24h) - 1) * 100
-        
-        # 1. Aşama: Funding Oranını Çek
-        funding_data = get_okx_data("/api/v5/public/funding-rate", {"instId": symbol})
-        if not funding_data: continue
-        funding = float(funding_data[0]['fundingRate']) * 100
-        
-        # STRATEJİ: Sert yükselen VE fonlaması negatif koinlere bak
-        # (Shortçuların kapana kısıldığı yerler)
-        if change > 5 and funding < -0.03:
+        change = (float(t['last']) / float(t['open24h']) - 1) * 100
+        if change > CHANGE_24H_LIMIT:
+            candles = get_data("/api/v5/market/candles", {"instId": symbol, "bar": "1H", "limit": "50"})
+            if not candles: continue
             
-            # 2. Aşama: Matematiksel Likidite Analizi
-            liq = get_orderbook_analysis(symbol, last_price)
-            if not liq: continue
+            df = pd.DataFrame(candles, columns=['ts','o','h','l','c','v','vc','vq','conf'])
+            df['c'] = df['c'].astype(float)
+            df['v'] = df['v'].astype(float)
             
-            msg = (
-                f"🚨 *OKX LİKİDASYON ANALİZİ: {symbol}*\n"
-                f"💰 Fiyat: `{last_price}`\n"
-                f"📈 24s Değişim: `% {round(change, 2)}`\n"
-                f"💸 Funding: `% {round(funding, 4)}` (Negatif!)\n\n"
-                f"🔥 *SHORT PATLATMA NOKTALARI (Liq):*\n"
-                f"• *50x:* `{liq['50x']['price']}` seviyesine kadar `{liq['50x']['vol']}` kontrat yığılmış.\n"
-                f"• *25x:* `{liq['25x']['price']}` seviyesine kadar `{liq['25x']['vol']}` kontrat yığılmış.\n\n"
-                f"⚠️ *Strateji:* Fiyat `{liq['50x']['price']}` üzerine iğne atarsa shortçular likit olur. İğne ucu dönüşünü bekle!"
-            )
+            # RSI ve Hacim Onayı (Tükeniş kontrolü)
+            rsi_series = calculate_rsi(df['c'][::-1]).reset_index(drop=True)
+            rsi = rsi_series.iloc[-1]
+            avg_vol = df['v'].iloc[1:21].mean()
+            curr_vol = df['v'].iloc[0]
             
-            send_telegram(msg)
-            print(f"Sinyal Bulundu: {symbol}")
-            time.sleep(1) # Telegram limitleri için
+            # ANA FİLTRELER + 15M TREND KIRILIMI ONAYI
+            if (rsi > RSI_LIMIT or curr_vol > avg_vol * 2.5):
+                if check_reversal_15m(symbol): # İŞTE KRİTİK ONAY BURASI
+                    funding = get_data("/api/v5/public/funding-rate", {"instId": symbol})
+                    f_rate = float(funding[0]['fundingRate']) * 100 if funding else 0
+                    wall_ratio, _ = check_whale_walls(symbol)
+                    
+                    msg = (f"📉 [SHORT BOTU]\n"
+                           f"🚨 *SİNYAL: {symbol}*\n"
+                           f"🌍 BTC 24s: {trend}\n"
+                           f"📈 Değişim: %{round(change, 2)}\n"
+                           f"📊 RSI (1H): {round(rsi, 2)}\n"
+                           f"💸 Funding: %{round(f_rate, 4)}\n"
+                           f"🧱 Balina: {round(wall_ratio, 1)}x\n"
+                           f"✅ *15M Güç Kaybı Onaylandı*")
+                    signals.append(msg)
+                    if len(signals) >= 5: break # Telegram limitine takılmamak için
+
+    if signals:
+        for s in signals: # Tek tek gönderim (Garanti yöntem)
+            send_telegram(s)
+        print(f"Başarılı! {len(signals)} sinyal gönderildi.")
+    else:
+        print("Uygun kriterlerde ve dönüş onayı almış coin bulunamadı.")
 
 if __name__ == "__main__":
     scan()
